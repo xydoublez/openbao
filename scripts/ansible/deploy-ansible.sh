@@ -80,38 +80,37 @@ ensure_ansible() {
     log_info "Ansible 安装成功"
 }
 
-# ========================== 检查 sshpass ======================================
-# Ansible 使用 -k (SSH 密码认证) 时需要 sshpass
-ensure_sshpass() {
-    # 如果指定了 SSH key, 不需要 sshpass
+# ========================== 检查 SSH 密钥 ====================================
+check_ssh_key() {
+    # 如果指定了 SSH key, 验证文件存在
     if [[ -n "${SSH_KEY}" ]]; then
+        if [[ ! -f "${SSH_KEY}" ]]; then
+            die "SSH 私钥文件不存在: ${SSH_KEY}\n请先生成密钥: ssh-keygen -t ed25519"
+        fi
+        log_info "SSH 密钥: ${SSH_KEY}"
         return 0
     fi
 
-    if command -v sshpass &>/dev/null; then
-        log_info "sshpass 已安装 (SSH 密码认证所需)"
+    # 未指定 --ssh-key, 检查默认密钥或 ssh-agent
+    if ssh-add -l &>/dev/null 2>&1; then
+        log_info "检测到 ssh-agent 已加载密钥 (无需 --ssh-key)"
         return 0
     fi
 
-    log_step "sshpass 未安装, 尝试自动安装 (SSH 密码认证所需)..."
+    local default_keys=(~/.ssh/id_ed25519 ~/.ssh/id_rsa ~/.ssh/id_ecdsa)
+    for key in "${default_keys[@]}"; do
+        if [[ -f "${key}" ]]; then
+            SSH_KEY="${key}"
+            log_info "使用默认 SSH 密钥: ${SSH_KEY}"
+            return 0
+        fi
+    done
 
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-    elif command -v yum &>/dev/null; then
-        sudo yum install -y sshpass
-    elif command -v dnf &>/dev/null; then
-        sudo dnf install -y sshpass
-    elif command -v brew &>/dev/null; then
-        brew install hudochenkov/sshpass/sshpass
-    else
-        die "无法自动安装 sshpass\n请手动安装:\n  Ubuntu/Debian: sudo apt install sshpass\n  CentOS/RHEL:   sudo yum install sshpass\n  或使用 SSH 密钥认证: --ssh-key ~/.ssh/id_rsa"
-    fi
-
-    if ! command -v sshpass &>/dev/null; then
-        die "sshpass 安装失败\n请手动安装或使用 SSH 密钥认证 (--ssh-key)"
-    fi
-
-    log_info "sshpass 安装成功"
+    log_warn "未找到 SSH 密钥, 请确保已通过以下方式之一配置免密登录:"
+    echo "    1. ssh-keygen -t ed25519 && ssh-copy-id ${SSH_USER}@<节点IP>"
+    echo "    2. 指定密钥: --ssh-key /path/to/private_key"
+    echo "    3. 配置 ~/.ssh/config 或 ssh-agent"
+    echo ""
 }
 
 # ========================== 生成密钥 ==========================================
@@ -257,10 +256,18 @@ OpenBao Static Key HA 集群 — Ansible 一键部署
   -h, --help             显示帮助
 
 关键优势 (对比 SSH 脚本):
+  - SSH 使用密钥认证, 完全免密码, 无需 sshpass
   - sudo 密码只需输入一次 (Ansible -K 参数)
   - 所有节点并行部署, 效率提升 N 倍
   - 离线安装使用 Ansible copy 模块, 稳定可靠
-  - 支持 SSH 密钥认证, 完全免密码
+
+前置条件:
+  1. 已配置 SSH 密钥免密登录:
+     ssh-keygen -t ed25519
+     ssh-copy-id sfxadmin@10.255.2.49
+     ssh-copy-id sfxadmin@10.255.2.195
+     ssh-copy-id sfxadmin@10.255.2.94
+  2. 或使用 --ssh-key 指定私钥路径
 
 示例:
   # 三节点部署 (sudo 密码只输入一次!)
@@ -307,6 +314,56 @@ parse_args() {
     done
 }
 
+# ========================== SSH 连通性预检 ====================================
+check_connectivity() {
+    log_step "检查所有节点 SSH 连通性 (${SSH_PORT}/tcp)..."
+
+    local failed_nodes=()
+    local ok_nodes=()
+
+    for node in "${NODE_LIST[@]}"; do
+        node="$(echo "${node}" | xargs)"
+
+        # 使用 bash 内置 /dev/tcp 或 nc 检测端口
+        if command -v nc &>/dev/null; then
+            if nc -z -w5 "${node}" "${SSH_PORT}" 2>/dev/null; then
+                ok_nodes+=("${node}")
+                echo -e "    ${GREEN}✓${NC} ${node}:${SSH_PORT} — 可达"
+            else
+                failed_nodes+=("${node}")
+                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 不可达"
+            fi
+        else
+            # fallback: bash /dev/tcp
+            if (echo >/dev/tcp/"${node}"/"${SSH_PORT}") 2>/dev/null; then
+                ok_nodes+=("${node}")
+                echo -e "    ${GREEN}✓${NC} ${node}:${SSH_PORT} — 可达"
+            else
+                failed_nodes+=("${node}")
+                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 不可达"
+            fi
+        fi
+    done
+
+    echo ""
+
+    if [[ ${#failed_nodes[@]} -gt 0 ]]; then
+        log_error "以下 ${#failed_nodes[@]} 个节点 SSH 不可达: ${failed_nodes[*]}"
+        echo ""
+        echo "  可能原因:"
+        echo "    1. 节点 IP 错误或未开机"
+        echo "    2. 防火墙未开放 ${SSH_PORT} 端口"
+        echo "    3. SSH 服务未启动"
+        echo "    4. 网络不通 (检查路由/安全组)"
+        echo ""
+        echo "  快速测试:  ssh -p ${SSH_PORT} ${SSH_USER}@${failed_nodes[0]}"
+        echo ""
+        die "请先解决网络连通性问题后重试"
+    fi
+
+    log_info "全部 ${#ok_nodes[@]} 个节点 SSH 连通性检查通过"
+}
+
 # ========================== 主流程 ============================================
 main() {
     parse_args "$@"
@@ -320,8 +377,8 @@ main() {
     # 1. 检查 Ansible
     ensure_ansible
 
-    # 2. 检查 sshpass (SSH 密码认证时需要)
-    ensure_sshpass
+    # 2. 检查 SSH 密钥 (免密登录)
+    check_ssh_key
 
     # 3. 检查节点列表
     [[ -z "${NODES}" ]] && die "请通过 --nodes 指定节点列表\n使用 --help 查看帮助"
@@ -334,8 +391,11 @@ main() {
     echo "  SSH:       ${SSH_USER}@*:${SSH_PORT}"
     echo "  版本:      v${OPENBAO_VERSION}"
     echo "  安装模式:  $([ -n "${LOCAL_BINARY}" ] && echo "离线 (${LOCAL_BINARY})" || echo "在线")"
-    echo "  SSH Key:   $([ -n "${SSH_KEY}" ] && echo "${SSH_KEY}" || echo "(未指定, 将使用密码)")"
+    echo "  SSH Key:   $([ -n "${SSH_KEY}" ] && echo "${SSH_KEY}" || echo "(自动检测)")"
     echo ""
+
+    # 5. SSH 连通性预检
+    check_connectivity
 
     # 清理模式
     if [[ "${CLEANUP}" == "true" ]]; then
@@ -390,20 +450,19 @@ main() {
     log_step "执行 Ansible Playbook..."
     echo ""
     echo "  sudo 密码只需在下方提示时输入一次!"
-    echo "  如果 SSH 也需要密码, 请加 -k 参数"
+    echo "  SSH 使用密钥认证 (免密), 无需 sshpass"
     echo ""
 
     local playbook_args=(
         -i "${INVENTORY_FILE}"
         "${ANSIBLE_DIR}/deploy.yml"
         "${EXTRA_VARS[@]}"
+        -K
     )
 
-    # 如果未指定 SSH key, 可能需要 SSH 密码 (-k) 和 sudo 密码 (-K)
-    if [[ -z "${SSH_KEY}" ]]; then
-        playbook_args+=(-k -K)
-    else
-        playbook_args+=(-K)
+    # 如果指定了 SSH key, 传给 Ansible
+    if [[ -n "${SSH_KEY}" ]]; then
+        playbook_args+=(--private-key "${SSH_KEY}")
     fi
 
     if [[ "${FORCE}" == "true" ]]; then

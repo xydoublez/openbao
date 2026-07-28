@@ -70,15 +70,35 @@
         - "{{ openbao_log_dir }}"
 
     # ── 3. 安装 OpenBao ──────────────────────────────────────────────────
-    - name: 检查 OpenBao 是否已安装
+    - name: 检查 OpenBao 二进制是否存在
       ansible.builtin.stat:
         path: "{{ openbao_install_dir }}/bao"
       register: bao_binary
 
+    - name: 检查已安装版本
+      when: bao_binary.stat.exists
+      ansible.builtin.command: "{{ openbao_install_dir }}/bao version"
+      register: bao_existing_version
+      changed_when: false
+      failed_when: false
+
+    - name: 判断是否需要安装
+      ansible.builtin.set_fact:
+        openbao_needs_install: >-
+          {{ not bao_binary.stat.exists
+             or openbao_version not in (bao_existing_version.stdout | default('')) }}
+
+    - name: 显示安装判定结果
+      ansible.builtin.debug:
+        msg: >-
+          {{ '已安装: ' + (bao_existing_version.stdout_lines | default(['unknown']) | first)
+             + ' | 目标: v' + openbao_version
+             + (' → 版本匹配, 跳过安装' if not openbao_needs_install else ' → 需要安装/升级') }}
+
     - name: "在线安装: 下载 OpenBao v{{ openbao_version }}"
       when:
         - openbao_install_mode == "online"
-        - not bao_binary.stat.exists
+        - openbao_needs_install
       block:
         - name: 检测系统架构
           ansible.builtin.set_fact:
@@ -118,7 +138,7 @@
     - name: "离线安装: 上传 OpenBao 二进制文件"
       when:
         - openbao_install_mode == "offline"
-        - not bao_binary.stat.exists
+        - openbao_needs_install
       block:
         - name: 上传本地 tar.gz 到远程节点
           ansible.builtin.copy:
