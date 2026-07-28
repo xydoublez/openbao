@@ -1,0 +1,64 @@
+---
+# ==============================================================================
+# OpenBao Static Key HA 集群 — Ansible 部署变量
+# ==============================================================================
+
+# ── OpenBao 版本 ───────────────────────────────────────────────────────────
+openbao_version: "2.6.1"
+openbao_install_dir: "/usr/local/bin"
+
+# ── 目录配置 (前缀 /msun) ──────────────────────────────────────────────────
+openbao_config_dir: "/etc/openbao"
+openbao_data_dir: "/msun/openbao/data"
+openbao_raft_dir: "/msun/openbao/raft"
+openbao_seal_dir: "/msun/openbao/secrets"
+openbao_tls_dir: "/msun/openbao/tls"
+openbao_log_dir: "/msun/openbao/logs"
+
+# ── 系统用户 ───────────────────────────────────────────────────────────────
+openbao_user: "openbao"
+openbao_group: "openbao"
+
+# ── 网络配置 ───────────────────────────────────────────────────────────────
+openbao_api_port: 8200
+openbao_cluster_port: 8201
+openbao_listen_addr: "0.0.0.0"
+
+# ── TLS ────────────────────────────────────────────────────────────────────
+openbao_enable_tls: false
+
+# ── UI ─────────────────────────────────────────────────────────────────────
+openbao_enable_ui: true
+
+# ── Static Key Seal ────────────────────────────────────────────────────────
+openbao_seal_key_id: "key-{{ ansible_date_time.date | regex_replace('-', '') }}-1"
+
+# ── Raft Autopilot ─────────────────────────────────────────────────────────
+openbao_raft_performance_multiplier: 1
+openbao_raft_trailing_logs: 10000
+openbao_raft_snapshot_threshold: 8192
+openbao_raft_snapshot_interval: "120s"
+openbao_raft_max_entry_size: 1048576
+openbao_autopilot_cleanup_dead_servers: true
+openbao_autopilot_last_contact_threshold: "10s"
+openbao_autopilot_max_trailing_logs: 250
+openbao_autopilot_min_quorum: 2
+openbao_autopilot_server_stabilization_time: "10s"
+
+# ── Recovery Key 配置 ──────────────────────────────────────────────────────
+openbao_key_shares: 3
+openbao_key_threshold: 2
+
+# ── 安装方式 ───────────────────────────────────────────────────────────────
+# "online"  = 从 GitHub Releases 下载
+# "offline" = 使用本地 tar.gz (需设置 openbao_local_binary)
+openbao_install_mode: "online"
+openbao_local_binary: ""
+# GitHub 下载地址前缀
+openbao_github_base_url: "https://github.com/openbao/openbao/releases/download"
+
+# ── 本地密钥文件路径 (由 wrapper 脚本生成后设置) ────────────────────────────
+openbao_seal_key_local_path: ""
+
+# ── Telemetry ──────────────────────────────────────────────────────────────
+openbao_prometheus_retention_time: "30s"

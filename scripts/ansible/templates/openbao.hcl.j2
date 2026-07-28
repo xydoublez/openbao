@@ -1,0 +1,61 @@
+# ============================================================================
+# OpenBao HA — Static Key Auto-Unseal + Raft
+# Node: {{ openbao_node_id }} ({{ ansible_host }})
+# Managed by Ansible — DO NOT EDIT MANUALLY
+# ============================================================================
+
+ui = {{ openbao_enable_ui | lower }}
+
+# -- Static Key 自动解封 --
+seal "static" {
+  current_key_id = "{{ openbao_seal_key_id }}"
+  current_key    = "file://{{ openbao_seal_dir }}/unseal.key"
+}
+
+# -- Raft 存储 (HA) --
+storage "raft" {
+  path    = "{{ openbao_raft_dir }}"
+  node_id = "{{ openbao_node_id }}"
+
+  performance_multiplier = {{ openbao_raft_performance_multiplier }}
+  trailing_logs          = {{ openbao_raft_trailing_logs }}
+  snapshot_threshold     = {{ openbao_raft_snapshot_threshold }}
+  snapshot_interval      = "{{ openbao_raft_snapshot_interval }}"
+  max_entry_size         = {{ openbao_raft_max_entry_size }}
+
+{% for peer in groups['openbao_cluster'] %}
+{% if peer != inventory_hostname %}
+  retry_join {
+    leader_api_addr = "{{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[peer]['ansible_host'] }}:{{ openbao_api_port }}"
+  }
+{% endif %}
+{% endfor %}
+
+  autopilot {
+    cleanup_dead_servers      = {{ openbao_autopilot_cleanup_dead_servers | lower }}
+    last_contact_threshold    = "{{ openbao_autopilot_last_contact_threshold }}"
+    max_trailing_logs         = {{ openbao_autopilot_max_trailing_logs }}
+    min_quorum                = {{ openbao_autopilot_min_quorum }}
+    server_stabilization_time = "{{ openbao_autopilot_server_stabilization_time }}"
+  }
+}
+
+# -- 监听器 --
+listener "tcp" {
+  address         = "{{ openbao_listen_addr }}:{{ openbao_api_port }}"
+  cluster_address = "{{ openbao_listen_addr }}:{{ openbao_cluster_port }}"
+{% if openbao_enable_tls %}
+  tls_cert_file   = "{{ openbao_tls_dir }}/tls.crt"
+  tls_key_file    = "{{ openbao_tls_dir }}/tls.key"
+{% else %}
+  tls_disable     = 1
+{% endif %}
+}
+
+api_addr     = "{{ 'https' if openbao_enable_tls else 'http' }}://{{ ansible_host }}:{{ openbao_api_port }}"
+cluster_addr = "{{ 'https' if openbao_enable_tls else 'http' }}://{{ ansible_host }}:{{ openbao_cluster_port }}"
+
+telemetry {
+  disable_hostname          = true
+  prometheus_retention_time = "{{ openbao_prometheus_retention_time }}"
+}

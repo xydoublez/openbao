@@ -1,0 +1,36 @@
+[Unit]
+Description=OpenBao - Secret Management & Data Protection
+Documentation=https://openbao.org/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty={{ openbao_config_dir }}/openbao.hcl
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+EnvironmentFile={{ openbao_config_dir }}/openbao.env
+User={{ openbao_user }}
+Group={{ openbao_group }}
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+AmbientCapabilities=CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart={{ openbao_install_dir }}/bao server -config={{ openbao_config_dir }}/openbao.hcl
+ExecReload=/bin/kill --signal HUP $MAINPID
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+MemorySwapMax=0
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

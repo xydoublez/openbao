@@ -1,0 +1,438 @@
+---
+# ==============================================================================
+# OpenBao Static Key HA 集群 — Ansible Playbook
+#
+# 用法:
+#   ansible-playbook -i inventory.ini deploy.yml -K
+#   (-K 提示输入 sudo 密码, 所有节点共用同一个密码, 只输入一次)
+#
+# 离线安装:
+#   ansible-playbook -i inventory.ini deploy.yml -K \
+#     -e openbao_install_mode=offline \
+#     -e openbao_local_binary=/tmp/openbao_2.6.1_linux_amd64.tar.gz
+# ==============================================================================
+
+# ==============================================================================
+# Play 1: 所有节点 — 安装 + 配置 + 启动
+# ==============================================================================
+- name: "OpenBao HA — 安装与配置所有节点"
+  hosts: openbao_cluster
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: 计算节点序号和 node_id
+      ansible.builtin.set_fact:
+        openbao_node_index: "{{ groups['openbao_cluster'].index(inventory_hostname) + 1 }}"
+        openbao_node_id: "node{{ groups['openbao_cluster'].index(inventory_hostname) + 1 }}"
+        openbao_protocol: "{{ 'https' if openbao_enable_tls else 'http' }}"
+
+    - name: 显示部署信息
+      ansible.builtin.debug:
+        msg: |
+          节点: {{ inventory_hostname }} ({{ ansible_host }})
+          Node ID: {{ openbao_node_id }}
+          版本: {{ openbao_version }}
+          安装模式: {{ openbao_install_mode }}
+
+  tasks:
+    # ── 1. 创建系统用户 ──────────────────────────────────────────────────
+    - name: 创建系统组 {{ openbao_group }}
+      ansible.builtin.group:
+        name: "{{ openbao_group }}"
+        system: true
+        state: present
+
+    - name: 创建系统用户 {{ openbao_user }}
+      ansible.builtin.user:
+        name: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+        state: present
+
+    # ── 2. 创建目录结构 ──────────────────────────────────────────────────
+    - name: 创建 OpenBao 目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0750"
+      loop:
+        - "{{ openbao_config_dir }}"
+        - "{{ openbao_data_dir }}"
+        - "{{ openbao_raft_dir }}"
+        - "{{ openbao_seal_dir }}"
+        - "{{ openbao_tls_dir }}"
+        - "{{ openbao_log_dir }}"
+
+    # ── 3. 安装 OpenBao ──────────────────────────────────────────────────
+    - name: 检查 OpenBao 是否已安装
+      ansible.builtin.stat:
+        path: "{{ openbao_install_dir }}/bao"
+      register: bao_binary
+
+    - name: "在线安装: 下载 OpenBao v{{ openbao_version }}"
+      when:
+        - openbao_install_mode == "online"
+        - not bao_binary.stat.exists
+      block:
+        - name: 检测系统架构
+          ansible.builtin.set_fact:
+            openbao_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+        - name: 下载 OpenBao
+          ansible.builtin.get_url:
+            url: "{{ openbao_github_base_url }}/v{{ openbao_version }}/openbao_{{ openbao_version }}_linux_{{ openbao_arch }}.tar.gz"
+            dest: "/tmp/openbao_{{ openbao_version }}.tar.gz"
+            mode: "0644"
+          register: download_result
+          retries: 3
+          delay: 5
+          until: download_result is succeeded
+
+        - name: 解压安装
+          ansible.builtin.unarchive:
+            src: "/tmp/openbao_{{ openbao_version }}.tar.gz"
+            dest: /tmp
+            remote_src: true
+
+        - name: 安装二进制文件
+          ansible.builtin.copy:
+            src: /tmp/bao
+            dest: "{{ openbao_install_dir }}/bao"
+            mode: "0755"
+            remote_src: true
+
+        - name: 清理临时文件
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "/tmp/openbao_{{ openbao_version }}.tar.gz"
+            - /tmp/bao
+
+    - name: "离线安装: 上传 OpenBao 二进制文件"
+      when:
+        - openbao_install_mode == "offline"
+        - not bao_binary.stat.exists
+      block:
+        - name: 上传本地 tar.gz 到远程节点
+          ansible.builtin.copy:
+            src: "{{ openbao_local_binary }}"
+            dest: /tmp/openbao-install.tar.gz
+            mode: "0644"
+
+        - name: 解压安装
+          ansible.builtin.unarchive:
+            src: /tmp/openbao-install.tar.gz
+            dest: /tmp
+            remote_src: true
+
+        - name: 安装二进制文件
+          ansible.builtin.copy:
+            src: /tmp/bao
+            dest: "{{ openbao_install_dir }}/bao"
+            mode: "0755"
+            remote_src: true
+
+        - name: 清理临时文件
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /tmp/openbao-install.tar.gz
+            - /tmp/bao
+
+    - name: 验证 OpenBao 版本
+      ansible.builtin.command: "{{ openbao_install_dir }}/bao version"
+      register: bao_version_output
+      changed_when: false
+
+    - name: 显示 OpenBao 版本
+      ansible.builtin.debug:
+        msg: "{{ bao_version_output.stdout }}"
+
+    # ── 4. 分发 Static Key 密钥 ──────────────────────────────────────────
+    - name: 分发 Seal 密钥到节点
+      ansible.builtin.copy:
+        src: "{{ openbao_seal_key_local_path }}"
+        dest: "{{ openbao_seal_dir }}/unseal.key"
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0400"
+
+    - name: 验证密钥文件大小 (必须 32 字节)
+      ansible.builtin.stat:
+        path: "{{ openbao_seal_dir }}/unseal.key"
+      register: key_stat
+
+    - name: 检查密钥大小
+      ansible.builtin.assert:
+        that:
+          - key_stat.stat.size == 32
+        fail_msg: "密钥文件大小 {{ key_stat.stat.size }} 字节, 需要 32 字节!"
+        success_msg: "密钥大小验证通过 (32 bytes)"
+
+    # ── 5. 部署配置文件 ──────────────────────────────────────────────────
+    - name: 部署 openbao.hcl 配置
+      ansible.builtin.template:
+        src: openbao.hcl.j2
+        dest: "{{ openbao_config_dir }}/openbao.hcl"
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0640"
+      notify: restart openbao
+
+    - name: 部署 openbao.env 环境变量
+      ansible.builtin.copy:
+        content: "BAO_ADDR=\"{{ openbao_protocol }}://127.0.0.1:{{ openbao_api_port }}\"\nBAO_SKIP_VERIFY=true\n"
+        dest: "{{ openbao_config_dir }}/openbao.env"
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0640"
+      notify: restart openbao
+
+    # ── 6. 部署 systemd 服务 ─────────────────────────────────────────────
+    - name: 部署 systemd service 单元
+      ansible.builtin.template:
+        src: openbao.service.j2
+        dest: /etc/systemd/system/openbao.service
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart openbao
+
+    - name: 启用 OpenBao 服务 (开机自启)
+      ansible.builtin.systemd:
+        name: openbao
+        enabled: true
+        daemon_reload: true
+
+    # ── 7. 启动服务 ──────────────────────────────────────────────────────
+    - name: 启动 OpenBao 服务
+      ansible.builtin.systemd:
+        name: openbao
+        state: started
+
+    - name: 等待 OpenBao API 就绪
+      ansible.builtin.uri:
+        url: "{{ openbao_protocol }}://127.0.0.1:{{ openbao_api_port }}/v1/sys/health"
+        validate_certs: false
+        status_code: [200, 429, 472, 473, 501, 503]
+      register: health_check
+      retries: 30
+      delay: 2
+      until: health_check is succeeded
+
+    - name: 显示节点健康状态
+      ansible.builtin.debug:
+        msg: "initialized={{ health_check.json.initialized }}, sealed={{ health_check.json.sealed }}"
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart openbao
+      ansible.builtin.systemd:
+        name: openbao
+        state: restarted
+      # 等待服务重启完成
+      register: restart_result
+      failed_when: false
+
+
+# ==============================================================================
+# Play 2: Leader 节点 — 初始化集群
+# ==============================================================================
+- name: "OpenBao HA — 初始化集群 (Leader)"
+  hosts: openbao_cluster[0]
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: 检查集群是否已初始化
+      ansible.builtin.uri:
+        url: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}/v1/sys/health"
+        validate_certs: false
+        status_code: [200, 429, 472, 473, 501, 503]
+      register: leader_health
+
+    - name: 初始化 OpenBao 集群
+      when: not leader_health.json.initialized
+      block:
+        - name: 执行 bao operator init
+          ansible.builtin.command: >
+            {{ openbao_install_dir }}/bao operator init
+            -key-shares={{ openbao_key_shares }}
+            -key-threshold={{ openbao_key_threshold }}
+            -format=json
+          environment:
+            BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+            BAO_SKIP_VERIFY: "true"
+          register: init_result
+
+        - name: 保存初始化结果到控制节点
+          ansible.builtin.copy:
+            content: "{{ init_result.stdout }}"
+            dest: "/tmp/openbao-init-{{ ansible_date_time.epoch }}/init-result.json"
+            mode: "0600"
+          delegate_to: localhost
+          become: false
+
+        - name: 解析 Recovery Keys 和 Root Token
+          ansible.builtin.set_fact:
+            openbao_recovery_keys: "{{ (init_result.stdout | from_json).keys | default((init_result.stdout | from_json).recovery_keys) }}"
+            openbao_root_token: "{{ (init_result.stdout | from_json).root_token }}"
+
+        - name: 保存 Recovery Keys
+          ansible.builtin.copy:
+            content: "{{ openbao_recovery_keys | join('\n') }}"
+            dest: "/tmp/openbao-init-{{ hostvars[groups['openbao_cluster'][0]]['ansible_date_time']['epoch'] | default(ansible_date_time.epoch) }}/recovery-keys.txt"
+            mode: "0600"
+          delegate_to: localhost
+          become: false
+
+        - name: 保存 Root Token
+          ansible.builtin.copy:
+            content: "{{ openbao_root_token }}"
+            dest: "/tmp/openbao-init-{{ hostvars[groups['openbao_cluster'][0]]['ansible_date_time']['epoch'] | default(ansible_date_time.epoch) }}/root-token.txt"
+            mode: "0600"
+          delegate_to: localhost
+          become: false
+
+        - name: 显示初始化结果
+          ansible.builtin.debug:
+            msg: |
+              集群初始化完成!
+              Recovery Keys 和 Root Token 已保存到控制节点 /tmp/openbao-init-*/
+              请妥善保存这些文件!
+
+    - name: 集群已初始化 (跳过)
+      when: leader_health.json.initialized
+      ansible.builtin.debug:
+        msg: "集群已初始化, 跳过 init 步骤"
+
+
+# ==============================================================================
+# Play 3: Follower 节点 — 加入 Raft 集群
+# ==============================================================================
+- name: "OpenBao HA — Follower 加入 Raft"
+  hosts: openbao_cluster
+  become: true
+  gather_facts: false
+  serial: 1  # 逐节点加入, 避免并发问题
+
+  tasks:
+    - name: 跳过 Leader 节点
+      when: inventory_hostname == groups['openbao_cluster'][0]
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} 是 Leader, 跳过 join"
+
+    - name: Follower 加入 Raft 集群
+      when: inventory_hostname != groups['openbao_cluster'][0]
+      block:
+        - name: 检查是否已在集群中
+          ansible.builtin.uri:
+            url: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}/v1/sys/health"
+            validate_certs: false
+            status_code: [200, 429, 472, 473, 501, 503]
+          register: follower_health
+
+        - name: 执行 bao operator raft join
+          when: not follower_health.json.get('ha_enabled', false)
+          ansible.builtin.command: >
+            {{ openbao_install_dir }}/bao operator raft join
+            {{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[groups['openbao_cluster'][0]]['ansible_host'] }}:{{ openbao_api_port }}
+          environment:
+            BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+            BAO_SKIP_VERIFY: "true"
+          register: join_result
+          failed_when: false
+
+        - name: 显示 Join 结果
+          ansible.builtin.debug:
+            msg: "{{ join_result.stdout | default('已在集群中') }}"
+
+        - name: 等待节点同步
+          ansible.builtin.pause:
+            seconds: 5
+
+
+# ==============================================================================
+# Play 4: 验证集群
+# ==============================================================================
+- name: "OpenBao HA — 验证集群状态"
+  hosts: openbao_cluster
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: 重新计算 node_id
+      ansible.builtin.set_fact:
+        openbao_node_id: "node{{ groups['openbao_cluster'].index(inventory_hostname) + 1 }}"
+
+  tasks:
+    - name: 检查各节点健康状态
+      ansible.builtin.uri:
+        url: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}/v1/sys/health"
+        validate_certs: false
+        status_code: [200, 429, 472, 473, 501, 503]
+      register: final_health
+
+    - name: 显示集群状态汇总
+      ansible.builtin.debug:
+        msg: |
+          {{ inventory_hostname }} ({{ openbao_node_id }}):
+            initialized: {{ final_health.json.initialized }}
+            sealed:      {{ final_health.json.sealed }}
+            ha_enabled:  {{ final_health.json.get('ha_enabled', 'N/A') }}
+            version:     {{ final_health.json.get('version', 'N/A') }}
+
+# ==============================================================================
+# Play 5: Leader — 输出 Raft Peers
+# ==============================================================================
+- name: "OpenBao HA — Raft 集群成员"
+  hosts: openbao_cluster[0]
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: 获取 Raft Peers
+      ansible.builtin.command: "{{ openbao_install_dir }}/bao operator raft list-peers"
+      environment:
+        BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+        BAO_SKIP_VERIFY: "true"
+      register: raft_peers
+      failed_when: false
+
+    - name: 显示 Raft 成员
+      ansible.builtin.debug:
+        msg: "{{ raft_peers.stdout | default('(需要先 bao login 后才能查看)') }}"
+
+    - name: 部署完成总结
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          OpenBao v{{ openbao_version }} Static Key HA 集群部署完成!
+          ============================================================
+          集群节点:
+          {% for host in groups['openbao_cluster'] %}
+            node{{ loop.index }}: {{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[host]['ansible_host'] }}:{{ openbao_api_port }}
+          {% endfor %}
+
+          配置文件: {{ openbao_config_dir }}/openbao.hcl
+          Seal密钥: {{ openbao_seal_dir }}/unseal.key (自动解封)
+          数据目录: {{ openbao_raft_dir }}
+
+          使用:
+            export BAO_ADDR={{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[groups['openbao_cluster'][0]]['ansible_host'] }}:{{ openbao_api_port }}
+            export BAO_SKIP_VERIFY=true
+            bao login
+            bao operator raft list-peers
+          ============================================================
