@@ -31,7 +31,8 @@ openbao_enable_tls: false
 openbao_enable_ui: true
 
 # ── Static Key Seal ────────────────────────────────────────────────────────
-openbao_seal_key_id: "key-{{ ansible_date_time.date | regex_replace('-', '') }}-1"
+# 注意: key_id 必须固定, 不要包含日期等变化因素, 否则重部署会导致配置不一致
+openbao_seal_key_id: "static-key-1"
 
 # ── Raft Autopilot ─────────────────────────────────────────────────────────
 openbao_raft_performance_multiplier: 1
@@ -45,9 +46,9 @@ openbao_autopilot_max_trailing_logs: 250
 openbao_autopilot_min_quorum: 2
 openbao_autopilot_server_stabilization_time: "10s"
 
-# ── Recovery Key 配置 ──────────────────────────────────────────────────────
-openbao_key_shares: 3
-openbao_key_threshold: 2
+# ── Recovery Key 配置 (仅用于显示参考, Static Seal 不支持 key-shares/key-threshold) ──
+# openbao_key_shares: 3
+# openbao_key_threshold: 2
 
 # ── 安装方式 ───────────────────────────────────────────────────────────────
 # "online"  = 从 GitHub Releases 下载

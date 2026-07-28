@@ -13,6 +13,7 @@
 #   ./deploy-ansible.sh --nodes "10.0.1.11,10.0.1.12,10.0.1.13" --ssh-user sfxadmin
 #   ./deploy-ansible.sh --nodes "10.0.1.11,10.0.1.12,10.0.1.13" --ssh-user sfxadmin \
 #     --local-binary /tmp/openbao_2.6.1_linux_amd64.tar.gz
+#   ./deploy-ansible.sh --reinit --nodes "10.0.1.11,10.0.1.12,10.0.1.13" --ssh-user sfxadmin
 #   ./deploy-ansible.sh --cleanup --nodes "10.0.1.11,10.0.1.12,10.0.1.13" --ssh-user sfxadmin
 # ==============================================================================
 
@@ -30,6 +31,7 @@ LOCAL_BINARY=""
 OPENBAO_VERSION="2.6.1"
 FORCE="false"
 CLEANUP="false"
+REINIT="false"
 SKIP_KEY_GEN="false"
 EXTRA_VARS=""
 
@@ -186,6 +188,81 @@ EOF
     echo ""
 }
 
+# ========================== 重新初始化 Playbook ================================
+generate_reinit_playbook() {
+    cat > "${ANSIBLE_DIR}/reinit.yml" <<'EOF'
+---
+# 重新初始化 OpenBao 集群 (清除 Raft 数据, 保留安装和配置)
+- name: "重新初始化 — 停止服务并清除 Raft 数据"
+  hosts: openbao_cluster
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: 停止 OpenBao 服务
+      ansible.builtin.systemd:
+        name: openbao
+        state: stopped
+      failed_when: false
+
+    - name: 删除 Raft 数据目录
+      ansible.builtin.file:
+        path: "{{ openbao_raft_dir }}"
+        state: absent
+
+    - name: 重建 Raft 数据目录
+      ansible.builtin.file:
+        path: "{{ openbao_raft_dir }}"
+        state: directory
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0750"
+
+    - name: 启动 OpenBao 服务
+      ansible.builtin.systemd:
+        name: openbao
+        state: started
+
+    - name: 等待 API 就绪
+      ansible.builtin.uri:
+        url: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}/v1/sys/health"
+        validate_certs: false
+        status_code: [200, 429, 472, 473, 501, 503]
+      register: health
+      retries: 15
+      delay: 2
+      until: health is succeeded
+
+    - name: 确认节点处于未初始化状态
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: initialized={{ health.json.initialized }} (应为 false)"
+
+- name: "重新初始化 — 清除控制节点旧数据 + 取回 Seal Key"
+  hosts: openbao_cluster[0]
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: 取回 Seal Key 到控制节点
+      ansible.builtin.fetch:
+        src: "{{ openbao_seal_dir }}/unseal.key"
+        dest: /tmp/openbao-reinit-key/unseal.key
+        flat: true
+
+    - name: 删除旧的初始化结果
+      ansible.builtin.file:
+        path: /tmp/openbao-init
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: 提示
+      ansible.builtin.debug:
+        msg: "旧数据已清除, Seal Key 已取回, 接下来将重新执行 deploy.yml 进行初始化"
+EOF
+}
+
 # ========================== 清理 Playbook =====================================
 generate_cleanup_playbook() {
     cat > "${ANSIBLE_DIR}/cleanup.yml" <<'EOF'
@@ -214,7 +291,7 @@ generate_cleanup_playbook() {
 
     - name: 删除 OpenBao 二进制
       ansible.builtin.file:
-        path: /usr/local/bin/bao
+        path: "{{ openbao_install_dir }}/bao"
         state: absent
 
     - name: 删除配置与数据目录
@@ -222,23 +299,23 @@ generate_cleanup_playbook() {
         path: "{{ item }}"
         state: absent
       loop:
-        - /etc/openbao
-        - /msun/openbao/data
-        - /msun/openbao/raft
-        - /msun/openbao/secrets
-        - /msun/openbao/tls
-        - /msun/openbao/logs
+        - "{{ openbao_config_dir }}"
+        - "{{ openbao_data_dir }}"
+        - "{{ openbao_raft_dir }}"
+        - "{{ openbao_seal_dir }}"
+        - "{{ openbao_tls_dir }}"
+        - "{{ openbao_log_dir }}"
 
     - name: 删除系统用户
       ansible.builtin.user:
-        name: openbao
+        name: "{{ openbao_user }}"
         state: absent
         remove: false
       failed_when: false
 
     - name: 删除系统组
       ansible.builtin.group:
-        name: openbao
+        name: "{{ openbao_group }}"
         state: absent
       failed_when: false
 
@@ -265,7 +342,8 @@ OpenBao Static Key HA 集群 — Ansible 一键部署
   --version VERSION      OpenBao 版本 (默认: 2.6.1)
   --seal-key PATH        使用已有密钥文件 (跳过生成)
   --force                跳过确认
-  --cleanup              清理集群
+  --reinit               重新初始化集群 (清除Raft数据, 保留安装)
+  --cleanup              清理集群 (完全卸载)
   -h, --help             显示帮助
 
 关键优势 (对比 SSH 脚本):
@@ -300,7 +378,12 @@ OpenBao Static Key HA 集群 — Ansible 一键部署
     --ssh-user sfxadmin \
     --ssh-key ~/.ssh/id_rsa
 
-  # 清理集群
+  # 重新初始化集群 (root token 丢失时使用)
+  ./deploy-ansible.sh --reinit \
+    --nodes "10.255.2.49,10.255.2.195,10.255.2.94" \
+    --ssh-user sfxadmin
+
+  # 清理集群 (完全卸载)
   ./deploy-ansible.sh --cleanup \
     --nodes "10.255.2.49,10.255.2.195,10.255.2.94" \
     --ssh-user sfxadmin
@@ -320,6 +403,7 @@ parse_args() {
             --version)      OPENBAO_VERSION="$2"; shift 2 ;;
             --seal-key)     SEAL_KEY_FILE="$2"; SKIP_KEY_GEN="true"; shift 2 ;;
             --force)        FORCE="true"; shift ;;
+            --reinit)       REINIT="true"; shift ;;
             --cleanup)      CLEANUP="true"; shift ;;
             -h|--help)      usage ;;
             *)              die "未知选项: $1\n使用 --help 查看帮助" ;;
@@ -409,11 +493,11 @@ main() {
     # 1. 检查 Ansible
     ensure_ansible
 
-    # 2. 检查 SSH 密钥 (免密登录)
-    check_ssh_key
-
-    # 3. 检查节点列表
+    # 2. 检查节点列表 (必须在 check_ssh_key 之前, 因其内部使用 NODES)
     [[ -z "${NODES}" ]] && die "请通过 --nodes 指定节点列表\n使用 --help 查看帮助"
+
+    # 3. 检查 SSH 密钥 (免密登录)
+    check_ssh_key
 
     IFS=',' read -ra NODE_LIST <<< "${NODES}"
     local node_count="${#NODE_LIST[@]}"
@@ -428,6 +512,74 @@ main() {
 
     # 5. SSH 连通性预检
     check_connectivity
+
+    # 重新初始化模式
+    if [[ "${REINIT}" == "true" ]]; then
+        log_step "重新初始化模式"
+        generate_inventory
+        generate_reinit_playbook
+
+        echo -e "${YELLOW}即将重新初始化 ${node_count} 个节点的 OpenBao 集群${NC}"
+        echo -e "${YELLOW}  - 清除所有 Raft 数据 (集群数据将丢失!)${NC}"
+        echo -e "${YELLOW}  - 保留已安装的二进制、配置和 systemd 服务${NC}"
+        echo -e "${YELLOW}  - 重新执行初始化, 生成新的 Root Token${NC}"
+        if [[ "${FORCE}" != "true" ]]; then
+            echo -en "${YELLOW}确认重新初始化? [y/N]: ${NC}"
+            read -r reply
+            [[ "${reply}" =~ ^[Yy]$ ]] || { log_info "取消"; exit 0; }
+        fi
+
+        log_step "Step 1/2: 停止服务 + 清除 Raft 数据..."
+        echo -e "${BLUE}  (需要输入 sudo 密码, 共两次)${NC}"
+        ansible-playbook \
+            -i "${INVENTORY_FILE}" \
+            "${ANSIBLE_DIR}/reinit.yml" \
+            -K 2>&1
+
+        log_step "Step 2/2: 重新部署 (初始化 + Join)..."
+        # 构造 extra vars
+        EXTRA_VARS=(-e "openbao_version=${OPENBAO_VERSION}")
+        if [[ -n "${LOCAL_BINARY}" ]]; then
+            LOCAL_BINARY="$(cd "$(dirname "${LOCAL_BINARY}")" && pwd)/$(basename "${LOCAL_BINARY}")"
+            EXTRA_VARS+=(-e "openbao_install_mode=offline" -e "openbao_local_binary=${LOCAL_BINARY}")
+        fi
+
+        # Seal key: 优先用 --seal-key 指定的, 否则用 reinit.yml fetch 回来的
+        local seal_key_path="${SEAL_KEY_FILE:-}"
+        if [[ -z "${seal_key_path}" || ! -f "${seal_key_path}" ]]; then
+            seal_key_path="/tmp/openbao-reinit-key/unseal.key"
+            if [[ ! -f "${seal_key_path}" ]]; then
+                die "无法找到 seal key (reinit.yml fetch 失败), 请使用 --seal-key 指定密钥文件"
+            fi
+            log_info "使用从节点取回的 seal key: ${seal_key_path}"
+        fi
+        EXTRA_VARS+=(-e "openbao_seal_key_local_path=${seal_key_path}")
+
+        local reinit_args=(
+            -i "${INVENTORY_FILE}"
+            "${ANSIBLE_DIR}/deploy.yml"
+            "${EXTRA_VARS[@]}"
+            -K
+        )
+        [[ -n "${SSH_KEY}" ]] && reinit_args+=(--private-key "${SSH_KEY}")
+
+        ansible-playbook "${reinit_args[@]}"
+
+        # 清理临时 seal key 文件
+        [[ -d /tmp/openbao-reinit-key ]] && rm -rf /tmp/openbao-reinit-key
+
+        echo ""
+        echo "============================================================"
+        echo -e "${GREEN}  重新初始化完成!${NC}"
+        echo "============================================================"
+        echo ""
+        echo "  管理员交付文件:"
+        echo "    /tmp/openbao-init/cluster-info.txt  — 完整交付信息"
+        echo "    /tmp/openbao-init/root-token.txt    — 新的 Root Token"
+        echo "    /tmp/openbao-init/recovery-keys.txt — 新的 Recovery Keys"
+        echo ""
+        exit 0
+    fi
 
     # 清理模式
     if [[ "${CLEANUP}" == "true" ]]; then
@@ -516,8 +668,12 @@ main() {
         echo -e "${GREEN}  部署完成!${NC}"
         echo "============================================================"
         echo ""
-        echo "  初始化结果保存在: /tmp/openbao-init/"
-        echo "  Root Token: cat /tmp/openbao-init/root-token.txt"
+        echo "  管理员交付文件:"
+        echo "    /tmp/openbao-init/cluster-info.txt  — 完整交付信息 (含所有凭据)"
+        echo "    /tmp/openbao-init/root-token.txt    — Root Token"
+        echo "    /tmp/openbao-init/recovery-keys.txt — Recovery Keys"
+        echo ""
+        echo -e "  ${YELLOW}请立即将以上文件保存到安全位置!${NC}"
         echo ""
     else
         echo ""

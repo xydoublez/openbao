@@ -86,7 +86,8 @@
       ansible.builtin.set_fact:
         openbao_needs_install: >-
           {{ not bao_binary.stat.exists
-             or openbao_version not in (bao_existing_version.stdout | default('')) }}
+             or not ((bao_existing_version.stdout | default(''))
+                     is search('v' ~ openbao_version ~ '([^0-9]|$)')) }}
 
     - name: 显示安装判定结果
       ansible.builtin.debug:
@@ -368,12 +369,12 @@
           failed_when: false
 
         - name: 显示已保存的 Root Token
-          when: saved_token is succeeded
+          when: saved_token.content is defined
           ansible.builtin.debug:
             msg: "之前保存的 Root Token: {{ saved_token.content | b64decode | trim }}"
 
         - name: 未找到已保存的 Token
-          when: saved_token is not succeeded
+          when: saved_token.content is not defined
           ansible.builtin.debug:
             msg: |
               警告: 集群已初始化但未找到之前保存的 Root Token 文件
@@ -399,15 +400,29 @@
     - name: Follower 加入 Raft 集群
       when: inventory_hostname != groups['openbao_cluster'][0]
       block:
-        - name: 检查是否已在集群中
-          ansible.builtin.uri:
-            url: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}/v1/sys/health"
-            validate_certs: false
-            status_code: [200, 429, 472, 473, 501, 503]
-          register: follower_health
+        - name: 检查节点是否已加入集群
+          ansible.builtin.command: >
+            {{ openbao_install_dir }}/bao operator raft list-peers
+            -format=json
+          environment:
+            BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://{{ hostvars[groups['openbao_cluster'][0]]['ansible_host'] }}:{{ openbao_api_port }}"
+            BAO_SKIP_VERIFY: "true"
+          register: raft_peers_check
+          failed_when: false
+          delegate_to: "{{ groups['openbao_cluster'][0] }}"
+
+        - name: 计算是否需要 Join
+          ansible.builtin.set_fact:
+            _node_already_joined: >-
+              {{ ('node' ~ (groups['openbao_cluster'].index(inventory_hostname) + 1))
+                 in ((raft_peers_check.stdout | default('{}') | from_json).data.config.servers
+                     | default([]) | map(attribute='node_id') | list) }}
+          when: raft_peers_check.rc == 0
 
         - name: 执行 bao operator raft join
-          when: not follower_health.json.get('ha_enabled', false)
+          when: >
+            raft_peers_check.rc != 0
+            or not (_node_already_joined | default(false))
           ansible.builtin.command: >
             {{ openbao_install_dir }}/bao operator raft join
             {{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[groups['openbao_cluster'][0]]['ansible_host'] }}:{{ openbao_api_port }}
@@ -419,7 +434,7 @@
 
         - name: 显示 Join 结果
           ansible.builtin.debug:
-            msg: "{{ join_result.stdout | default('已在集群中') }}"
+            msg: "{{ join_result.stdout | default(join_result.stderr | default('已在集群中')) }}"
 
         - name: 等待节点同步
           ansible.builtin.pause:
@@ -457,12 +472,12 @@
             version:     {{ final_health.json.get('version', 'N/A') }}
 
 # ==============================================================================
-# Play 5: Leader — 输出 Raft Peers
+# Play 5: Leader — 集群验证 + 管理员交付信息
 # ==============================================================================
-- name: "OpenBao HA — Raft 集群成员"
+- name: "OpenBao HA — 集群验证与交付"
   hosts: openbao_cluster[0]
   become: true
-  gather_facts: false
+  gather_facts: true
 
   tasks:
     - name: 获取 Raft Peers
@@ -477,24 +492,132 @@
       ansible.builtin.debug:
         msg: "{{ raft_peers.stdout | default('(需要先 bao login 后才能查看)') }}"
 
-    - name: 部署完成总结
+    # ── 收集管理员交付信息 ────────────────────────────────────────────
+    - name: 读取 Root Token
+      ansible.builtin.slurp:
+        src: /tmp/openbao-init/root-token.txt
+      register: _root_token_file
+      delegate_to: localhost
+      become: false
+      failed_when: false
+
+    - name: 读取 Recovery Keys
+      ansible.builtin.slurp:
+        src: /tmp/openbao-init/recovery-keys.txt
+      register: _recovery_keys_file
+      delegate_to: localhost
+      become: false
+      failed_when: false
+
+    - name: 读取 Seal Key (Base64)
+      ansible.builtin.slurp:
+        src: "{{ openbao_seal_dir }}/unseal.key"
+      register: _seal_key_file
+
+    - name: 设置交付变量
+      ansible.builtin.set_fact:
+        _deliver_root_token: "{{ (_root_token_file.content | b64decode | trim) if _root_token_file.content is defined else '(未找到, 请检查 /tmp/openbao-init/root-token.txt)' }}"
+        _deliver_recovery_keys: "{{ (_recovery_keys_file.content | b64decode | trim) if _recovery_keys_file.content is defined else '(未找到)' }}"
+        _deliver_seal_key_b64: "{{ _seal_key_file.content | trim }}"
+
+    - name: 生成管理员交付文件 (cluster-info.txt)
+      ansible.builtin.copy:
+        content: |
+          ================================================================
+          OpenBao v{{ openbao_version }} Static Key HA 集群 — 管理员交付信息
+          生成时间: {{ ansible_date_time.iso8601 }}
+          ================================================================
+
+          【集群节点】
+          {% for host in groups['openbao_cluster'] %}
+            node{{ loop.index }}: {{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[host]['ansible_host'] }}:{{ openbao_api_port }}
+          {% endfor %}
+
+          【Root Token】(管理员登录凭证, 请妥善保管!)
+            {{ _deliver_root_token }}
+
+          【Recovery Keys】(恢复密钥, 紧急情况下使用)
+          {% for line in _deliver_recovery_keys.split('\n') %}
+            {{ line }}
+          {% endfor %}
+
+          【Static Seal Key】(自动解封密钥, Base64)
+            {{ _deliver_seal_key_b64 }}
+
+          【服务信息】
+            配置文件: {{ openbao_config_dir }}/openbao.hcl
+            环境变量: {{ openbao_config_dir }}/openbao.env
+            Seal密钥: {{ openbao_seal_dir }}/unseal.key
+            数据目录: {{ openbao_raft_dir }}
+            日志目录: {{ openbao_log_dir }}
+            服务管理: systemctl {start|stop|restart|status} openbao
+            运行用户: {{ openbao_user }}
+            安装路径: {{ openbao_install_dir }}/bao
+
+          【快速使用】
+            export BAO_ADDR={{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[groups['openbao_cluster'][0]]['ansible_host'] }}:{{ openbao_api_port }}
+            export BAO_SKIP_VERIFY=true
+            bao login    (输入上方 Root Token)
+            bao status
+            bao operator raft list-peers
+
+          【ELB / 负载均衡】
+            监听端口: {{ openbao_api_port }} (API)
+            后端端口: {{ openbao_api_port }}
+            健康检查: /v1/sys/health
+
+          【安全组端口】
+            22   — SSH (管理)
+            {{ openbao_api_port }} — API (客户端访问, 对 ELB 开放)
+            {{ openbao_cluster_port }} — Raft 集群通信 (仅节点间)
+
+          【注意事项】
+            - Root Token 仅初始化时显示一次, 请立即保存到安全位置
+            - Seal Key 用于自动解封, 已部署在各节点 {{ openbao_seal_dir }}/unseal.key
+            - 建议使用 LDAP/OIDC 认证后禁用 Root Token
+            - 生产环境建议启用 TLS (openbao_enable_tls: true)
+          ================================================================
+        dest: /tmp/openbao-init/cluster-info.txt
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+    - name: 显示管理员交付信息
       ansible.builtin.debug:
         msg: |
           ============================================================
           OpenBao v{{ openbao_version }} Static Key HA 集群部署完成!
           ============================================================
-          集群节点:
+
+          【集群节点】
           {% for host in groups['openbao_cluster'] %}
             node{{ loop.index }}: {{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[host]['ansible_host'] }}:{{ openbao_api_port }}
           {% endfor %}
 
-          配置文件: {{ openbao_config_dir }}/openbao.hcl
-          Seal密钥: {{ openbao_seal_dir }}/unseal.key (自动解封)
-          数据目录: {{ openbao_raft_dir }}
+          【Root Token】
+            {{ _deliver_root_token }}
 
-          使用:
+          【Recovery Keys】
+          {% for line in _deliver_recovery_keys.split('\n') %}
+            {{ line }}
+          {% endfor %}
+
+          【Static Seal Key (Base64)】
+            {{ _deliver_seal_key_b64 }}
+
+          【服务管理】
+            systemctl status openbao
+            配置: {{ openbao_config_dir }}/openbao.hcl
+            数据: {{ openbao_raft_dir }}
+
+          【快速使用】
             export BAO_ADDR={{ 'https' if openbao_enable_tls else 'http' }}://{{ hostvars[groups['openbao_cluster'][0]]['ansible_host'] }}:{{ openbao_api_port }}
             export BAO_SKIP_VERIFY=true
             bao login
-            bao operator raft list-peers
+
+          【交付文件】
+            /tmp/openbao-init/cluster-info.txt  — 完整交付信息
+            /tmp/openbao-init/root-token.txt    — Root Token
+            /tmp/openbao-init/recovery-keys.txt — Recovery Keys
+            /tmp/openbao-init/init-result.json  — 初始化原始 JSON
           ============================================================
