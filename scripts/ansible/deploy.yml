@@ -300,7 +300,7 @@
 
         - name: 创建输出目录
           ansible.builtin.file:
-            path: "/tmp/openbao-init-{{ ansible_date_time.epoch }}"
+            path: /tmp/openbao-init
             state: directory
             mode: "0700"
           delegate_to: localhost
@@ -309,7 +309,7 @@
         - name: 保存初始化结果到控制节点
           ansible.builtin.copy:
             content: "{{ init_result.stdout }}"
-            dest: "/tmp/openbao-init-{{ ansible_date_time.epoch }}/init-result.json"
+            dest: /tmp/openbao-init/init-result.json
             mode: "0600"
           delegate_to: localhost
           become: false
@@ -322,7 +322,7 @@
         - name: 保存 Recovery Keys
           ansible.builtin.copy:
             content: "{{ openbao_recovery_keys | join('\n') }}"
-            dest: "/tmp/openbao-init-{{ hostvars[groups['openbao_cluster'][0]]['ansible_date_time']['epoch'] | default(ansible_date_time.epoch) }}/recovery-keys.txt"
+            dest: /tmp/openbao-init/recovery-keys.txt
             mode: "0600"
           delegate_to: localhost
           become: false
@@ -330,22 +330,55 @@
         - name: 保存 Root Token
           ansible.builtin.copy:
             content: "{{ openbao_root_token }}"
-            dest: "/tmp/openbao-init-{{ hostvars[groups['openbao_cluster'][0]]['ansible_date_time']['epoch'] | default(ansible_date_time.epoch) }}/root-token.txt"
+            dest: /tmp/openbao-init/root-token.txt
             mode: "0600"
           delegate_to: localhost
           become: false
 
-        - name: 显示初始化结果
+        - name: 显示初始化结果 (重要!)
           ansible.builtin.debug:
             msg: |
-              集群初始化完成!
-              Recovery Keys 和 Root Token 已保存到控制节点 /tmp/openbao-init-*/
-              请妥善保存这些文件!
+              ============================================================
+              集群初始化完成! 请立即保存以下信息!
+              ============================================================
+
+              Root Token: {{ openbao_root_token }}
+
+              Recovery Keys:
+              {% for key in openbao_recovery_keys %}
+                {{ loop.index }}. {{ key }}
+              {% endfor %}
+
+              文件已保存到控制节点: /tmp/openbao-init/
+              ============================================================
 
     - name: 集群已初始化 (跳过)
       when: leader_health.json.initialized
-      ansible.builtin.debug:
-        msg: "集群已初始化, 跳过 init 步骤"
+      block:
+        - name: 提示已初始化
+          ansible.builtin.debug:
+            msg: "集群已初始化, 跳过 init 步骤"
+
+        - name: 尝试读取之前保存的 Root Token
+          ansible.builtin.slurp:
+            src: /tmp/openbao-init/root-token.txt
+          register: saved_token
+          delegate_to: localhost
+          become: false
+          failed_when: false
+
+        - name: 显示已保存的 Root Token
+          when: saved_token is succeeded
+          ansible.builtin.debug:
+            msg: "之前保存的 Root Token: {{ saved_token.content | b64decode | trim }}"
+
+        - name: 未找到已保存的 Token
+          when: saved_token is not succeeded
+          ansible.builtin.debug:
+            msg: |
+              警告: 集群已初始化但未找到之前保存的 Root Token 文件
+              请检查 /tmp/openbao-init/root-token.txt 是否存在
+              如果 Token 丢失, 需要重新初始化集群 (会丢失数据)
 
 
 # ==============================================================================

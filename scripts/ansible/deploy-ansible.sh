@@ -516,8 +516,8 @@ main() {
         echo -e "${GREEN}  部署完成!${NC}"
         echo "============================================================"
         echo ""
-        echo "  初始化结果保存在: /tmp/openbao-init-*/"
-        echo "  查看: cat /tmp/openbao-init-*/root-token.txt"
+        echo "  初始化结果保存在: /tmp/openbao-init/"
+        echo "  Root Token: cat /tmp/openbao-init/root-token.txt"
         echo ""
     else
         echo ""
