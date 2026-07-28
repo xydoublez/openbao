@@ -298,6 +298,14 @@
             BAO_SKIP_VERIFY: "true"
           register: init_result
 
+        - name: 创建输出目录
+          ansible.builtin.file:
+            path: "/tmp/openbao-init-{{ ansible_date_time.epoch }}"
+            state: directory
+            mode: "0700"
+          delegate_to: localhost
+          become: false
+
         - name: 保存初始化结果到控制节点
           ansible.builtin.copy:
             content: "{{ init_result.stdout }}"
