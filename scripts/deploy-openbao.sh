@@ -13,9 +13,11 @@ set -euo pipefail
 OPENBAO_VERSION="${OPENBAO_VERSION:-2.6.1}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/openbao}"
-DATA_DIR="${DATA_DIR:-/opt/openbao/data}"
-TLS_DIR="${TLS_DIR:-/opt/openbao/tls}"
-LOG_DIR="${LOG_DIR:-/var/log/openbao}"
+DATA_DIR="${DATA_DIR:-/msun/openbao/data}"
+TLS_DIR="${TLS_DIR:-/msun/openbao/tls}"
+LOG_DIR="${LOG_DIR:-/msun/openbao/logs}"
+RAFT_DIR="${RAFT_DIR:-/msun/openbao/raft}"
+SEAL_DIR="${SEAL_DIR:-/msun/openbao/seals}"
 BAO_USER="${BAO_USER:-openbao}"
 BAO_GROUP="${BAO_GROUP:-openbao}"
 
@@ -80,6 +82,33 @@ check_dependencies() {
         die "缺少必要依赖: ${missing[*]}。请先安装后重试。"
     fi
     log_info "所有依赖检查通过$([ -n "$LOCAL_BINARY" ] && echo ' (离线模式)')"
+}
+
+# ========================== 数据盘检测 ========================================
+check_data_disk() {
+    local mount_base
+    mount_base="$(dirname "$DATA_DIR")"  # /msun/openbao -> /msun
+
+    # 检测挂载点
+    if mountpoint -q "$mount_base" 2>/dev/null; then
+        local fs_info
+        fs_info="$(df -h "$mount_base" | tail -1)"
+        local disk_size
+        disk_size="$(echo "$fs_info" | awk '{print $2}')"
+        local disk_avail
+        disk_avail="$(echo "$fs_info" | awk '{print $4}')"
+        log_info "数据盘检测通过: ${mount_base} (总容量: ${disk_size}, 可用: ${disk_avail})"
+    elif [[ -d "$mount_base" ]]; then
+        log_warn "${mount_base} 未检测到独立挂载点，数据将存储在系统盘"
+        log_warn "建议将数据盘挂载到 ${mount_base} 以提高性能和数据安全"
+        if ! confirm "继续安装到系统盘?"; then
+            log_info "取消安装"
+            exit 0
+        fi
+    else
+        log_warn "${mount_base} 目录不存在，将自动创建"
+        log_warn "建议先挂载数据盘: mount /dev/vdb ${mount_base}"
+    fi
 }
 
 # ========================== 架构检测 ==========================================
@@ -209,7 +238,7 @@ setup_user_and_dirs() {
         log_info "创建系统用户: ${BAO_USER}"
     fi
 
-    for dir in "$CONFIG_DIR" "$DATA_DIR" "$TLS_DIR" "$LOG_DIR" "/opt/openbao/raft"; do
+    for dir in "$CONFIG_DIR" "$DATA_DIR" "$TLS_DIR" "$LOG_DIR" "$RAFT_DIR" "$SEAL_DIR"; do
         install -d -m 0750 -o "$BAO_USER" -g "$BAO_GROUP" "$dir"
     done
 
@@ -322,7 +351,7 @@ EOF
 
 generate_ha_config() {
     local config_file="$1"
-    local raft_data="/opt/openbao/raft"
+    local raft_data="${RAFT_DIR}"
 
     local tls_block=""
     if [[ "$ENABLE_TLS" == "true" ]]; then
@@ -792,7 +821,7 @@ uninstall() {
         rm -f /etc/systemd/system/openbao.service
         systemctl daemon-reload
         rm -f "${INSTALL_DIR}/bao"
-        rm -rf "$CONFIG_DIR" "$DATA_DIR" "$TLS_DIR" "$LOG_DIR" "/opt/openbao"
+        rm -rf "$CONFIG_DIR" "$DATA_DIR" "$TLS_DIR" "$LOG_DIR" "$RAFT_DIR" "$SEAL_DIR"
         userdel "$BAO_USER" 2>/dev/null || true
         groupdel "$BAO_GROUP" 2>/dev/null || true
         log_info "OpenBao 已卸载"
@@ -841,7 +870,11 @@ GPG 初始化选项 (与 init 子命令配合使用):
   OPENBAO_VERSION    版本号       (默认: 2.6.1)
   INSTALL_DIR        安装目录     (默认: /usr/local/bin)
   CONFIG_DIR         配置目录     (默认: /etc/openbao)
-  DATA_DIR           数据目录     (默认: /opt/openbao/data)
+  DATA_DIR           File存储目录 (默认: /msun/openbao/data)
+  RAFT_DIR           Raft存储目录 (默认: /msun/openbao/raft)
+  TLS_DIR            TLS证书目录  (默认: /msun/openbao/tls)
+  SEAL_DIR           Seal密钥目录 (默认: /msun/openbao/seals)
+  LOG_DIR            日志目录     (默认: /msun/openbao/logs)
   DEPLOY_MODE        部署模式     (standalone|ha)
   NODE_ID            节点 ID
   API_ADDR           API 地址
@@ -993,6 +1026,7 @@ main() {
 
     check_dependencies
     detect_arch
+    check_data_disk
 
     if ! confirm "确认安装 OpenBao v${OPENBAO_VERSION} (${DEPLOY_MODE} 模式)?"; then
         log_info "取消安装"
