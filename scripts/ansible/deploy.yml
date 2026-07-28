@@ -232,8 +232,11 @@
         enabled: true
         daemon_reload: true
 
-    # ── 7. 启动服务 ──────────────────────────────────────────────────────
-    - name: 启动 OpenBao 服务
+    # ── 7. 刷新 handlers + 启动服务 ────────────────────────────────────
+    - name: 刷新 handlers (配置变更后先重启)
+      ansible.builtin.meta: flush_handlers
+
+    - name: 确保 OpenBao 服务运行
       ansible.builtin.systemd:
         name: openbao
         state: started
@@ -289,8 +292,6 @@
         - name: 执行 bao operator init
           ansible.builtin.command: >
             {{ openbao_install_dir }}/bao operator init
-            -key-shares={{ openbao_key_shares }}
-            -key-threshold={{ openbao_key_threshold }}
             -format=json
           environment:
             BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
@@ -307,7 +308,7 @@
 
         - name: 解析 Recovery Keys 和 Root Token
           ansible.builtin.set_fact:
-            openbao_recovery_keys: "{{ (init_result.stdout | from_json).keys | default((init_result.stdout | from_json).recovery_keys) }}"
+            openbao_recovery_keys: "{{ (init_result.stdout | from_json).recovery_keys | default((init_result.stdout | from_json).keys | default([])) }}"
             openbao_root_token: "{{ (init_result.stdout | from_json).root_token }}"
 
         - name: 保存 Recovery Keys

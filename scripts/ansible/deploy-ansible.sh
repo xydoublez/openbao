@@ -93,7 +93,7 @@ check_ssh_key() {
 
     # 未指定 --ssh-key, 检查默认密钥或 ssh-agent
     if ssh-add -l &>/dev/null 2>&1; then
-        log_info "检测到 ssh-agent 已加载密钥 (无需 --ssh-key)"
+        log_info "检测到 ssh-agent 已加载密钥"
         return 0
     fi
 
@@ -106,11 +106,24 @@ check_ssh_key() {
         fi
     done
 
-    log_warn "未找到 SSH 密钥, 请确保已通过以下方式之一配置免密登录:"
-    echo "    1. ssh-keygen -t ed25519 && ssh-copy-id ${SSH_USER}@<节点IP>"
-    echo "    2. 指定密钥: --ssh-key /path/to/private_key"
-    echo "    3. 配置 ~/.ssh/config 或 ssh-agent"
+    # 没有找到任何密钥, 自动生成
+    log_warn "未找到 SSH 密钥, 自动生成..."
+    local new_key="${HOME}/.ssh/id_ed25519"
+    mkdir -p "${HOME}/.ssh"
+    ssh-keygen -t ed25519 -f "${new_key}" -N "" -q
+    SSH_KEY="${new_key}"
+    log_info "已生成 SSH 密钥: ${SSH_KEY}"
     echo ""
+    echo -e "${YELLOW}  密钥已生成, 但还需要将公钥分发到所有节点。${NC}"
+    echo -e "${YELLOW}  请执行以下命令 (每个节点输入一次密码):${NC}"
+    echo ""
+    IFS=',' read -ra _nodes <<< "${NODES}"
+    for node in "${_nodes[@]}"; do
+        node="$(echo "${node}" | xargs)"
+        echo "    ssh-copy-id -p ${SSH_PORT} ${SSH_USER}@${node}"
+    done
+    echo ""
+    die "公钥分发完成后重新运行此脚本"
 }
 
 # ========================== 生成密钥 ==========================================
@@ -316,31 +329,49 @@ parse_args() {
 
 # ========================== SSH 连通性预检 ====================================
 check_connectivity() {
-    log_step "检查所有节点 SSH 连通性 (${SSH_PORT}/tcp)..."
+    log_step "检查所有节点 SSH 连通性 + 认证..."
 
     local failed_nodes=()
     local ok_nodes=()
+    local ssh_key_opt=""
+    [[ -n "${SSH_KEY}" ]] && ssh_key_opt="-i ${SSH_KEY}"
 
     for node in "${NODE_LIST[@]}"; do
         node="$(echo "${node}" | xargs)"
 
-        # 使用 bash 内置 /dev/tcp 或 nc 检测端口
+        # Step 1: 检测端口是否可达
+        local port_ok="false"
         if command -v nc &>/dev/null; then
-            if nc -z -w5 "${node}" "${SSH_PORT}" 2>/dev/null; then
-                ok_nodes+=("${node}")
-                echo -e "    ${GREEN}✓${NC} ${node}:${SSH_PORT} — 可达"
-            else
-                failed_nodes+=("${node}")
-                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 不可达"
-            fi
+            nc -z -w5 "${node}" "${SSH_PORT}" 2>/dev/null && port_ok="true"
         else
-            # fallback: bash /dev/tcp
-            if (echo >/dev/tcp/"${node}"/"${SSH_PORT}") 2>/dev/null; then
-                ok_nodes+=("${node}")
-                echo -e "    ${GREEN}✓${NC} ${node}:${SSH_PORT} — 可达"
+            (echo >/dev/tcp/"${node}"/"${SSH_PORT}") 2>/dev/null && port_ok="true"
+        fi
+
+        if [[ "${port_ok}" != "true" ]]; then
+            failed_nodes+=("${node}:端口不可达")
+            echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 端口不可达"
+            continue
+        fi
+
+        # Step 2: 检测 SSH 认证 (密钥登录)
+        local ssh_result
+        ssh_result="$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            -o BatchMode=yes -p "${SSH_PORT}" ${ssh_key_opt} \
+            "${SSH_USER}@${node}" "echo SSH_OK" 2>&1)" || true
+
+        if [[ "${ssh_result}" == *"SSH_OK"* ]]; then
+            ok_nodes+=("${node}")
+            echo -e "    ${GREEN}✓${NC} ${node}:${SSH_PORT} — 端口可达 + 认证成功"
+        else
+            failed_nodes+=("${node}:认证失败")
+            # 提取错误关键信息
+            local err_msg="${ssh_result}"
+            if [[ "${err_msg}" == *"Permission denied"* ]]; then
+                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 端口可达, 但认证失败 (Permission denied)"
+            elif [[ "${err_msg}" == *"Connection refused"* ]]; then
+                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — SSH 服务拒绝连接"
             else
-                failed_nodes+=("${node}")
-                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 不可达"
+                echo -e "    ${RED}✗${NC} ${node}:${SSH_PORT} — 认证失败: ${err_msg:0:80}"
             fi
         fi
     done
@@ -348,20 +379,21 @@ check_connectivity() {
     echo ""
 
     if [[ ${#failed_nodes[@]} -gt 0 ]]; then
-        log_error "以下 ${#failed_nodes[@]} 个节点 SSH 不可达: ${failed_nodes[*]}"
+        log_error "以下节点 SSH 不可用: ${failed_nodes[*]}"
         echo ""
-        echo "  可能原因:"
-        echo "    1. 节点 IP 错误或未开机"
-        echo "    2. 防火墙未开放 ${SSH_PORT} 端口"
-        echo "    3. SSH 服务未启动"
-        echo "    4. 网络不通 (检查路由/安全组)"
+        echo "  端口不可达: 检查 IP/防火墙/SSH服务"
+        echo "  认证失败:   公钥未分发到目标节点"
         echo ""
-        echo "  快速测试:  ssh -p ${SSH_PORT} ${SSH_USER}@${failed_nodes[0]}"
+        echo -e "${YELLOW}  修复认证失败 — 分发公钥到所有节点:${NC}"
+        for fn in "${failed_nodes[@]}"; do
+            local fn_ip="${fn%%:*}"
+            echo "    ssh-copy-id -p ${SSH_PORT} ${SSH_USER}@${fn_ip}"
+        done
         echo ""
-        die "请先解决网络连通性问题后重试"
+        die "请先解决问题后重试"
     fi
 
-    log_info "全部 ${#ok_nodes[@]} 个节点 SSH 连通性检查通过"
+    log_info "全部 ${#ok_nodes[@]} 个节点 SSH 连通性 + 认证检查通过"
 }
 
 # ========================== 主流程 ============================================
