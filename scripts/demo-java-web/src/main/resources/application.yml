@@ -1,0 +1,42 @@
+# OpenBao 连接配置
+openbao:
+  # OpenBao 服务地址
+  uri: ${OPENBAO_ADDR:http://127.0.0.1:8200}
+  # Transit 引擎密钥名称
+  transit-key: ${OPENBAO_TRANSIT_KEY:app-key}
+  # 认证方式: token 或 approle
+  auth-method: ${OPENBAO_AUTH_METHOD:approle}
+  # Token 认证 (开发用, 生产环境请用 AppRole)
+  token: ${OPENBAO_TOKEN:}
+  # AppRole 认证
+  approle:
+    role-id: ${OPENBAO_ROLE_ID:}
+    secret-id: ${OPENBAO_SECRET_ID:}
+
+# Spring 应用配置
+spring:
+  application:
+    name: openbao-transit-demo
+  datasource:
+    url: jdbc:h2:mem:testdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+
+# 服务端口
+server:
+  port: 8080
+
+# 日志
+logging:
+  level:
+    com.example.openbaodemo: DEBUG
+    org.springframework.vault: DEBUG
