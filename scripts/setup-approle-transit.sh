@@ -48,6 +48,9 @@ FORCE="false"
 SKIP_TRANSIT_ENABLE="false"
 SKIP_APPROLE_ENABLE="false"
 OUTPUT_DIR=""
+RENEW_SECRET="false"
+REVOKE_OLD="false"
+OLD_SECRET_ID_ACCESSOR=""
 BAO_ADDR="${BAO_ADDR:-http://127.0.0.1:8200}"
 
 # ========================== 颜色与日志 ========================================
@@ -119,6 +122,8 @@ usage() {
     echo "  --skip-transit-enable     跳过启用 Transit 引擎 (已启用时使用)"
     echo "  --skip-approle-enable     跳过启用 AppRole 认证 (已启用时使用)"
     echo "  --output-dir, -o <dir>    将凭据输出到指定目录"
+    echo "  --renew-secret            为已有 AppRole 下发新 Secret ID (替换凭据)"
+    echo "  --revoke-old              配合 --renew-secret，同时吊销旧 Secret ID"
     echo "  --force, -f               跳过确认提示，直接执行"
     echo "  -h, --help                显示帮助信息"
     echo ""
@@ -139,6 +144,12 @@ usage() {
     echo ""
     echo "  # 全自动模式 (CI/CD)"
     echo "  BAO_TOKEN=root-token $0 --app order-service --force"
+    echo ""
+    echo "  # 为已有应用下发新 Secret ID (替换凭据)"
+    echo "  $0 --app order-service --renew-secret"
+    echo ""
+    echo "  # 下发新 Secret ID 并吊销旧的"
+    echo "  $0 --app order-service --namespace team-a --renew-secret --revoke-old --force"
     exit 0
 }
 
@@ -157,6 +168,8 @@ while [[ $# -gt 0 ]]; do
         --skip-transit-enable)  SKIP_TRANSIT_ENABLE="true"; shift ;;
         --skip-approle-enable)  SKIP_APPROLE_ENABLE="true"; shift ;;
         --output-dir|-o)   _require_arg "$1" "${2:-}"; OUTPUT_DIR="$2"; shift 2 ;;
+        --renew-secret)      RENEW_SECRET="true"; shift ;;
+        --revoke-old)        REVOKE_OLD="true"; shift ;;
         --force|-f)        FORCE="true"; shift ;;
         -h|--help)         usage ;;
         *)                 die "未知参数: $1 (使用 -h 查看帮助)" ;;
@@ -166,13 +179,16 @@ done
 # ========================== 参数验证 ==========================================
 [[ -z "${APP_NAME}" ]] && die "缺少必需参数 --app (使用 -h 查看帮助)"
 
-# 校验密钥类型合法性
-_VALID_KEY_TYPES="aes128-gcm96 aes256-gcm96 chacha20-poly1305 rsa-2048 rsa-3072 rsa-4096 ecdsa-p256 ecdsa-p384 ecdsa-p521 ed25519"
-_VALID="false"
-for _VT in ${_VALID_KEY_TYPES}; do
-    [[ "${KEY_TYPE}" == "${_VT}" ]] && { _VALID="true"; break; }
-done
-[[ "${_VALID}" == "true" ]] || die "不支持的密钥类型: ${KEY_TYPE}\n  可选: ${_VALID_KEY_TYPES}"
+# renew-secret 模式不需要校验密钥类型
+if [[ "${RENEW_SECRET}" != "true" ]]; then
+    # 校验密钥类型合法性
+    _VALID_KEY_TYPES="aes128-gcm96 aes256-gcm96 chacha20-poly1305 rsa-2048 rsa-3072 rsa-4096 ecdsa-p256 ecdsa-p384 ecdsa-p521 ed25519"
+    _VALID="false"
+    for _VT in ${_VALID_KEY_TYPES}; do
+        [[ "${KEY_TYPE}" == "${_VT}" ]] && { _VALID="true"; break; }
+    done
+    [[ "${_VALID}" == "true" ]] || die "不支持的密钥类型: ${KEY_TYPE}\n  可选: ${_VALID_KEY_TYPES}"
+fi
 
 # 命名空间优先级：参数 > 环境变量
 NAMESPACE="${NAMESPACE:-${BAO_NAMESPACE:-}}"
@@ -222,6 +238,241 @@ if [[ "${SEAL_STATUS}" == "true" ]]; then
     die "OpenBao 已封存，请先执行 bao operator unseal"
 fi
 log_ok "OpenBao 已解封"
+
+# ========================== Renew Secret 模式 ================================
+if [[ "${RENEW_SECRET}" == "true" ]]; then
+
+    log_step "模式: 为已有 AppRole 下发新 Secret ID"
+
+    # 设置命名空间
+    if [[ -n "${NAMESPACE}" ]]; then
+        export BAO_NAMESPACE="${NAMESPACE}"
+        log_info "命名空间: ${NAMESPACE}"
+    fi
+
+    # 验证 AppRole 角色存在
+    ROLE_INFO_JSON=""
+    if ROLE_INFO_JSON=$(bao read "auth/approle/role/${APP_NAME}" -format=json 2>/dev/null); then
+        log_ok "AppRole 角色 ${APP_NAME} 已存在"
+    else
+        die "AppRole 角色 ${APP_NAME} 不存在 (命名空间: ${NAMESPACE:-root})\n  请先执行初始配置: $0 --app ${APP_NAME}"
+    fi
+
+    # 读取角色现有配置
+    _ROLE_POLICIES=$(echo "${ROLE_INFO_JSON}" | _json_field "data.token_policies")
+    _ROLE_TTL=$(echo "${ROLE_INFO_JSON}" | _json_field "data.token_ttl")
+    _ROLE_MAX_TTL=$(echo "${ROLE_INFO_JSON}" | _json_field "data.token_max_ttl")
+    _ROLE_SID_TTL=$(echo "${ROLE_INFO_JSON}" | _json_field "data.secret_id_ttl")
+    _ROLE_SID_USES=$(echo "${ROLE_INFO_JSON}" | _json_field "data.secret_id_num_uses")
+
+    # 获取现有 secret-id accessor 列表 (用于吊销旧凭据)
+    OLD_ACCESSORS=""
+    if [[ "${REVOKE_OLD}" == "true" ]]; then
+        OLD_ACCESSORS=$(bao list "auth/approle/role/${APP_NAME}/secret-id" -format=json 2>/dev/null || echo "[]")
+        _OLD_COUNT=$(echo "${OLD_ACCESSORS}" | jq 'length' 2>/dev/null || echo "0")
+        log_info "当前存在 ${_OLD_COUNT} 个 Secret ID"
+    fi
+
+    # 确认执行
+    echo ""
+    echo -e "${BOLD}========== Renew Secret 摘要 ==========${NC}"
+    echo -e "  应用名称:       ${CYAN}${APP_NAME}${NC}"
+    echo -e "  命名空间:       ${CYAN}${NAMESPACE:-root (默认)}${NC}"
+    echo -e "  现有策略:       ${CYAN}${_ROLE_POLICIES:-N/A}${NC}"
+    echo -e "  Token TTL:      ${CYAN}${_ROLE_TTL:-N/A}${NC}"
+    echo -e "  Token Max TTL:  ${CYAN}${_ROLE_MAX_TTL:-N/A}${NC}"
+    echo -e "  吊销旧 Secret: ${CYAN}${REVOKE_OLD}${NC}"
+    echo -e "${BOLD}========================================${NC}"
+    echo ""
+
+    if [[ "${FORCE}" != "true" ]]; then
+        echo -en "${YELLOW}确认下发新 Secret ID? [y/N]: ${NC}"
+        read -r reply
+        [[ "${reply}" =~ ^[Yy]$ ]] || { log_warn "已取消"; exit 0; }
+    fi
+
+    # 生成新 Secret ID
+    log_step "生成新 Secret ID..."
+    _NEW_SID_JSON=$(bao write -f "auth/approle/role/${APP_NAME}/secret-id" -format=json 2>/dev/null)
+    NEW_SECRET_ID=$(echo "${_NEW_SID_JSON}" | _json_field "data.secret_id")
+    NEW_SECRET_ID_ACCESSOR=$(echo "${_NEW_SID_JSON}" | _json_field "data.secret_id_accessor")
+    if [[ -z "${NEW_SECRET_ID}" ]]; then
+        NEW_SECRET_ID=$(echo "${_NEW_SID_JSON}" | grep -o '"secret_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    fi
+    [[ -n "${NEW_SECRET_ID}" ]] || die "生成新 Secret ID 失败"
+    log_ok "新 Secret ID 生成成功"
+
+    # 吊销旧 Secret ID
+    if [[ "${REVOKE_OLD}" == "true" && -n "${OLD_ACCESSORS}" && "${OLD_ACCESSORS}" != "[]" ]]; then
+        log_step "吊销旧 Secret ID (${_OLD_COUNT} 个)..."
+        _REVOKED=0
+        for _ACC in $(echo "${OLD_ACCESSORS}" | jq -r '.[]' 2>/dev/null); do
+            # 跳过刚刚生成的新 accessor
+            if [[ "${_ACC}" == "${NEW_SECRET_ID_ACCESSOR}" ]]; then
+                continue
+            fi
+            if bao write "auth/approle/role/${APP_NAME}/secret-id/destroy" secret_id_accessor="${_ACC}" 2>/dev/null; then
+                _REVOKED=$((_REVOKED + 1))
+            else
+                log_warn "吊销 accessor ${_ACC:0:8}... 失败"
+            fi
+        done
+        log_ok "已吊销 ${_REVOKED} 个旧 Secret ID"
+    elif [[ "${REVOKE_OLD}" == "true" ]]; then
+        log_warn "无旧 Secret ID 可吊销 (或吊销失败)"
+    fi
+
+    # 获取 Role ID
+    ROLE_ID=$(bao read "auth/approle/role/${APP_NAME}/role-id" -format=json 2>/dev/null | _json_field "data.role_id")
+    if [[ -z "${ROLE_ID}" ]]; then
+        ROLE_ID=$(bao read "auth/approle/role/${APP_NAME}/role-id" -format=json 2>/dev/null | grep -o '"role_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    fi
+
+    SECRET_ID="${NEW_SECRET_ID}"
+
+    # 从角色配置推断策略名和 Transit 挂载
+    POLICY_NAME=$(echo "${_ROLE_POLICIES}" | grep -oE "${APP_NAME}-transit" || echo "${APP_NAME}-transit")
+    TRANSIT_MOUNT="${TRANSIT_MOUNT:-transit}"
+
+    # 输出结果
+    echo ""
+    echo -e "${BOLD}${GREEN}============================================================${NC}"
+    echo -e "${BOLD}${GREEN}  Secret ID 更新完成!${NC}"
+    echo -e "${BOLD}${GREEN}============================================================${NC}"
+    echo ""
+    echo -e "${BOLD}--- 新 AppRole 凭据 ---${NC}"
+    echo -e "  ${CYAN}Role ID:${NC}      ${ROLE_ID}"
+    echo -e "  ${CYAN}新 Secret ID:${NC} ${SECRET_ID}"
+    echo -e "  ${CYAN}Accessor:${NC}     ${NEW_SECRET_ID_ACCESSOR}"
+    if [[ "${REVOKE_OLD}" == "true" ]]; then
+        echo -e "  ${YELLOW}[!] 旧 Secret ID 已吊销，应用端请立即更新${NC}"
+    else
+        echo -e "  ${YELLOW}[!] 旧 Secret ID 仍然有效，请通知应用端切换后手动吊销${NC}"
+    fi
+    echo ""
+    log_warn "${YELLOW}Secret ID 已打印到终端，请注意命令行历史记录泄露风险。${NC}"
+    log_warn "${YELLOW}建议通过 --output-dir 参数将凭据写入文件 (权限 600)。${NC}"
+
+    # 生成凭据交付文件
+    DELIVERY_FILE="${OUTPUT_DIR:-.}/openbao-credential-delivery-${APP_NAME}-renewed-$(date '+%Y%m%d%H%M%S').txt"
+    _NS_HEADER_LINE=""
+    if [[ -n "${NAMESPACE}" ]]; then
+        _NS_HEADER_LINE="  X-Vault-Namespace:  ${NAMESPACE}  (如使用命名空间必须携带)"
+    fi
+
+    _generate_renew_delivery_file() {
+    cat <<RENEW_DELIVERY_EOF
+################################################################################
+#
+#  OpenBao KMS 凭据更新文件 (Secret ID Renewal)
+#  应用名称:   ${APP_NAME}
+#  更新时间:   $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+#  操作人:     $(whoami)@$(hostname)
+#  操作类型:   Secret ID Renewal${REVOKE_OLD:+ + Old Secret Revocation}
+#
+################################################################################
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. 更新摘要
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  服务地址:       ${BAO_ADDR}
+  命名空间:       ${NAMESPACE:-root (默认)}
+  应用名称:       ${APP_NAME}
+  策略:           ${_ROLE_POLICIES:-N/A}
+  Transit 挂载:   ${TRANSIT_MOUNT}
+
+  Role ID:        ${ROLE_ID}  (未变化)
+  新 Secret ID:   ${NEW_SECRET_ID}
+  Accessor:       ${NEW_SECRET_ID_ACCESSOR}
+
+  旧 Secret ID:   ${REVOKE_OLD:+已吊销}${REVOKE_OLD:-仍然有效，请手动吊销}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. 应用端操作 (必须立即执行!)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  更新环境变量中的 OPENBAO_SECRET_ID:
+
+  # 旧值 (请删除)
+  # OPENBAO_SECRET_ID="<old-secret-id>"
+
+  # 新值 (请替换)
+  OPENBAO_SECRET_ID="${NEW_SECRET_ID}"
+
+  应用需重新登录获取新 Token:
+
+  TOKEN=\$(bao write auth/approle/login \\
+    role_id="${ROLE_ID}" \\
+    secret_id="${NEW_SECRET_ID}" \\
+    -field=token)
+  export BAO_TOKEN="\${TOKEN}"
+
+  或使用 curl:
+
+  curl -s -X POST '${BAO_ADDR}/v1/auth/approle/login' \\
+    -H 'Content-Type: application/json' \\
+    -d '{"role_id":"${ROLE_ID}","secret_id":"${NEW_SECRET_ID}"}' \\
+    | jq -r '.auth.client_token'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. 快速验证 (确认新凭据可用)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  BAO="${BAO_ADDR}"
+  ROLE_ID="${ROLE_ID}"
+  SECRET_ID="${NEW_SECRET_ID}"
+
+  echo "[1/2] 使用新 Secret ID 登录..."
+  TOKEN=\$(curl -sf -X POST "\${BAO}/v1/auth/approle/login" \\
+    -H 'Content-Type: application/json' \\
+    -d "{\"role_id\":\"\${ROLE_ID}\",\"secret_id\":\"\${SECRET_ID}\"}" \\
+    | jq -r '.auth.client_token')
+  echo "  -> OK, Token: \${TOKEN:0:20}..."
+
+  echo "[2/2] 加密验证..."
+  PLAIN_B64=\$(echo -n "renew-verify-test" | base64)
+  CIPHER=\$(curl -sf -X POST "\${BAO}/v1/${TRANSIT_MOUNT}/encrypt/${APP_NAME}" \\
+    -H "X-Vault-Token: \${TOKEN}" \\
+    -H 'Content-Type: application/json' \\
+    -d "{\"plaintext\":\"\${PLAIN_B64}\"}" \\
+    | jq -r '.data.ciphertext')
+  echo "  -> OK, 密文: \${CIPHER}"
+  echo "  -> [PASS] 新凭据验证通过!"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. 安全须知
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [!] 此次操作已下发新的 Secret ID:
+
+  1. 应用端必须立即使用新 Secret ID 重新登录
+  2. ${REVOKE_OLD:+旧 Secret ID 已吊销，应用端使用旧凭据的请求将立即失败}
+  3. ${REVOKE_OLD:-旧 Secret ID 仍然有效，请在应用端完成切换后通知管理员吊销}
+  4. 禁止将新 Secret ID 写入代码或提交到 Git
+  5. 使用 .env + .gitignore 或配置中心存储
+
+################################################################################
+#  本文件由 setup-approle-transit.sh --renew-secret 自动生成
+#  重新生成: ./setup-approle-transit.sh --app ${APP_NAME} --renew-secret --output-dir <目录> --force
+################################################################################
+RENEW_DELIVERY_EOF
+    }
+
+    _generate_renew_delivery_file > "${DELIVERY_FILE}"
+    chmod 600 "${DELIVERY_FILE}"
+    log_info "凭据更新文件已生成: ${DELIVERY_FILE}"
+    echo ""
+    cat "${DELIVERY_FILE}"
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Secret ID 更新完成! 请立即通知应用端替换凭据。${NC}"
+    echo ""
+    exit 0
+fi
 
 # ========================== 确认执行 ==========================================
 echo ""
