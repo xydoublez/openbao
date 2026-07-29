@@ -381,6 +381,48 @@
               请检查 /tmp/openbao-init/root-token.txt 是否存在
               如果 Token 丢失, 需要重新初始化集群 (会丢失数据)
 
+    # ── 初始化后启用审计设备 ────────────────────────────────────────────
+    # 放在 init/已初始化 两个 block 之后, 确保 openbao_root_token 或 saved_token 已定义
+    - name: 确定审计用 Token
+      ansible.builtin.set_fact:
+        _audit_token: "{{ openbao_root_token | default((saved_token.content | b64decode | trim) if (saved_token.content is defined) else '') }}"
+
+    - name: 启用审计日志
+      when:
+        - openbao_audit_enabled | bool
+        - _audit_token | length > 0
+      block:
+        - name: 检查审计设备是否已启用
+          ansible.builtin.command: >
+            {{ openbao_install_dir }}/bao audit list -format=json
+          environment:
+            BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+            BAO_SKIP_VERIFY: "true"
+            BAO_TOKEN: "{{ _audit_token }}"
+          register: audit_list
+          changed_when: false
+          failed_when: false
+
+        - name: 启用 file 审计设备
+          when: "'file/' not in (audit_list.stdout | default(''))"
+          ansible.builtin.command: >
+            {{ openbao_install_dir }}/bao audit enable file
+            file_path={{ openbao_audit_file_path }}
+            mode={{ openbao_audit_mode }}
+          environment:
+            BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+            BAO_SKIP_VERIFY: "true"
+            BAO_TOKEN: "{{ _audit_token }}"
+          register: audit_enable_result
+          failed_when: false
+
+        - name: 显示审计设备状态
+          ansible.builtin.debug:
+            msg: >-
+              {{ '审计日志已启用: ' + openbao_audit_file_path
+                 if 'file/' in (audit_list.stdout | default('')) or audit_enable_result.rc | default(1) == 0
+                 else '审计日志启用失败' }}
+
 
 # ==============================================================================
 # Play 3: Follower 节点 — 加入 Raft 集群

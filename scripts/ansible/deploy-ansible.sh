@@ -32,6 +32,7 @@ OPENBAO_VERSION="2.6.1"
 FORCE="false"
 CLEANUP="false"
 REINIT="false"
+ENABLE_AUDIT="false"
 SKIP_KEY_GEN="false"
 EXTRA_VARS=""
 
@@ -263,6 +264,100 @@ generate_reinit_playbook() {
 EOF
 }
 
+# ========================== 审计 Playbook =====================================
+generate_audit_playbook() {
+    cat > "${ANSIBLE_DIR}/enable-audit.yml" <<'EOF'
+---
+# 为现有 OpenBao HA 集群启用文件审计设备
+- name: "启用审计日志"
+  hosts: openbao_cluster[0]
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: 读取 Root Token
+      ansible.builtin.slurp:
+        src: /tmp/openbao-init/root-token.txt
+      register: _token_file
+      delegate_to: localhost
+      become: false
+      failed_when: false
+
+    - name: 设置 Token 变量
+      ansible.builtin.set_fact:
+        _audit_token: "{{ (_token_file.content | b64decode | trim) if _token_file.content is defined else '' }}"
+
+    - name: 检查 Token 是否可用
+      ansible.builtin.assert:
+        that:
+          - _audit_token | length > 0
+        fail_msg: "未找到 Root Token, 请确认 /tmp/openbao-init/root-token.txt 存在"
+
+    - name: 检查审计设备是否已启用
+      ansible.builtin.command: >
+        {{ openbao_install_dir }}/bao audit list -format=json
+      environment:
+        BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+        BAO_SKIP_VERIFY: "true"
+        BAO_TOKEN: "{{ _audit_token }}"
+      register: audit_list
+      changed_when: false
+      failed_when: false
+
+    - name: 启用 file 审计设备
+      when: "'file/' not in (audit_list.stdout | default(''))"
+      ansible.builtin.command: >
+        {{ openbao_install_dir }}/bao audit enable file
+        file_path={{ openbao_audit_file_path }}
+        mode={{ openbao_audit_mode }}
+      environment:
+        BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+        BAO_SKIP_VERIFY: "true"
+        BAO_TOKEN: "{{ _audit_token }}"
+
+    - name: 验证审计设备
+      ansible.builtin.command: >
+        {{ openbao_install_dir }}/bao audit list
+      environment:
+        BAO_ADDR: "{{ ('https' if openbao_enable_tls else 'http') }}://127.0.0.1:{{ openbao_api_port }}"
+        BAO_SKIP_VERIFY: "true"
+        BAO_TOKEN: "{{ _audit_token }}"
+      register: audit_verify
+      changed_when: false
+
+    - name: 显示结果
+      ansible.builtin.debug:
+        msg: |
+          审计设备已启用!
+          {{ audit_verify.stdout }}
+          日志路径: {{ openbao_audit_file_path }}
+
+- name: "确保日志目录权限"
+  hosts: openbao_cluster
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: 确保日志目录存在且权限正确
+      ansible.builtin.file:
+        path: "{{ openbao_log_dir }}"
+        state: directory
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "0750"
+
+    - name: 创建审计日志文件 (确保可写)
+      ansible.builtin.file:
+        path: "{{ openbao_audit_file_path }}"
+        state: touch
+        owner: "{{ openbao_user }}"
+        group: "{{ openbao_group }}"
+        mode: "{{ openbao_audit_mode }}"
+        modification_time: preserve
+        access_time: preserve
+EOF
+}
+
 # ========================== 清理 Playbook =====================================
 generate_cleanup_playbook() {
     cat > "${ANSIBLE_DIR}/cleanup.yml" <<'EOF'
@@ -343,6 +438,7 @@ OpenBao Static Key HA 集群 — Ansible 一键部署
   --seal-key PATH        使用已有密钥文件 (跳过生成)
   --force                跳过确认
   --reinit               重新初始化集群 (清除Raft数据, 保留安装)
+  --enable-audit         为现有集群启用审计日志
   --cleanup              清理集群 (完全卸载)
   -h, --help             显示帮助
 
@@ -383,6 +479,11 @@ OpenBao Static Key HA 集群 — Ansible 一键部署
     --nodes "10.255.2.49,10.255.2.195,10.255.2.94" \
     --ssh-user sfxadmin
 
+  # 为现有集群启用审计日志
+  ./deploy-ansible.sh --enable-audit \
+    --nodes "10.255.2.49,10.255.2.195,10.255.2.94" \
+    --ssh-user sfxadmin
+
   # 清理集群 (完全卸载)
   ./deploy-ansible.sh --cleanup \
     --nodes "10.255.2.49,10.255.2.195,10.255.2.94" \
@@ -404,6 +505,7 @@ parse_args() {
             --seal-key)     SEAL_KEY_FILE="$2"; SKIP_KEY_GEN="true"; shift 2 ;;
             --force)        FORCE="true"; shift ;;
             --reinit)       REINIT="true"; shift ;;
+            --enable-audit) ENABLE_AUDIT="true"; shift ;;
             --cleanup)      CLEANUP="true"; shift ;;
             -h|--help)      usage ;;
             *)              die "未知选项: $1\n使用 --help 查看帮助" ;;
@@ -601,6 +703,42 @@ main() {
             -K 2>&1
 
         log_info "清理完成"
+        exit 0
+    fi
+
+    # 启用审计模式
+    if [[ "${ENABLE_AUDIT}" == "true" ]]; then
+        log_step "启用审计日志模式"
+        generate_inventory
+        generate_audit_playbook
+
+        echo -e "${YELLOW}即将为 ${node_count} 个节点的集群启用审计日志${NC}"
+        echo -e "  审计日志路径: /msun/openbao/logs/audit.log"
+        echo -e "  需要有效的 Root Token (保存在 /tmp/openbao-init/root-token.txt)"
+        if [[ "${FORCE}" != "true" ]]; then
+            echo -en "${YELLOW}确认启用? [y/N]: ${NC}"
+            read -r reply
+            [[ "${reply}" =~ ^[Yy]$ ]] || { log_info "取消"; exit 0; }
+        fi
+
+        log_step "执行启用审计日志..."
+        local audit_args=(
+            -i "${INVENTORY_FILE}"
+            "${ANSIBLE_DIR}/enable-audit.yml"
+            -K
+        )
+        [[ -n "${SSH_KEY}" ]] && audit_args+=(--private-key "${SSH_KEY}")
+
+        ansible-playbook "${audit_args[@]}"
+
+        echo ""
+        echo "============================================================"
+        echo -e "${GREEN}  审计日志已启用!${NC}"
+        echo "============================================================"
+        echo ""
+        echo "  日志文件: /msun/openbao/logs/audit.log (各节点)"
+        echo "  查看日志: tail -f /msun/openbao/logs/audit.log"
+        echo ""
         exit 0
     fi
 

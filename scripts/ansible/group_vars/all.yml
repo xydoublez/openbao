@@ -63,3 +63,9 @@ openbao_seal_key_local_path: ""
 
 # ── Telemetry ──────────────────────────────────────────────────────────────
 openbao_prometheus_retention_time: "30s"
+
+# ── 审计日志 ──────────────────────────────────────────────────────────────
+# 首次初始化时默认启用审计设备 (bao audit enable file)
+openbao_audit_enabled: true
+openbao_audit_file_path: "/msun/openbao/logs/audit.log"
+openbao_audit_mode: "0640"
