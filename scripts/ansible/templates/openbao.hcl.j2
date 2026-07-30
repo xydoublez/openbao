@@ -52,6 +52,17 @@ listener "tcp" {
 {% endif %}
 }
 
+{% if openbao_audit_enabled %}
+# -- 审计日志 (声明式配置) --
+audit "file" "audit-log" {
+  description = "File audit device managed by Ansible"
+  options {
+    file_path = "{{ openbao_audit_file_path }}"
+    mode      = "{{ openbao_audit_mode }}"
+  }
+}
+{% endif %}
+
 api_addr     = "{{ 'https' if openbao_enable_tls else 'http' }}://{{ ansible_host }}:{{ openbao_api_port }}"
 cluster_addr = "{{ 'https' if openbao_enable_tls else 'http' }}://{{ ansible_host }}:{{ openbao_cluster_port }}"
 
