@@ -242,7 +242,7 @@ log_ok "OpenBao 已解封"
 # ========================== Renew Secret 模式 ================================
 if [[ "${RENEW_SECRET}" == "true" ]]; then
 
-    log_step "模式: 为已有 AppRole 下发新 Secret ID"
+    log_step "模式: --renew-secret"
 
     # 设置命名空间
     if [[ -n "${NAMESPACE}" ]]; then
@@ -252,11 +252,24 @@ if [[ "${RENEW_SECRET}" == "true" ]]; then
 
     # 验证 AppRole 角色存在
     ROLE_INFO_JSON=""
+    _ROLE_EXISTS="false"
     if ROLE_INFO_JSON=$(bao read "auth/approle/role/${APP_NAME}" -format=json 2>/dev/null); then
-        log_ok "AppRole 角色 ${APP_NAME} 已存在"
+        _ROLE_EXISTS="true"
+        log_ok "AppRole 角色 ${APP_NAME} 已存在，进入凭据轮换流程"
     else
-        die "AppRole 角色 ${APP_NAME} 不存在 (命名空间: ${NAMESPACE:-root})\n  请先执行初始配置: $0 --app ${APP_NAME}"
+        log_warn "AppRole 角色 ${APP_NAME} 不存在 (命名空间: ${NAMESPACE:-root})"
+        log_warn "自动降级为初始配置模式，将创建完整的 AppRole + Transit 配置"
+        # 降级为初始配置模式
+        RENEW_SECRET="false"
+        if [[ "${REVOKE_OLD}" == "true" ]]; then
+            log_warn "--revoke-old 参数在初始配置模式下无效 (无旧凭据可吊销)"
+        fi
+        # 清除 BAO_NAMESPACE，让 Step 1 从 root 命名空间重新创建
+        unset BAO_NAMESPACE 2>/dev/null || true
     fi
+
+    # 角色存在时才执行 renew 流程，否则降级为初始配置
+    if [[ "${_ROLE_EXISTS}" == "true" ]]; then
 
     # 读取角色现有配置
     _ROLE_POLICIES=$(echo "${ROLE_INFO_JSON}" | _json_field "data.token_policies")
@@ -472,6 +485,8 @@ RENEW_DELIVERY_EOF
     echo -e "${GREEN}${BOLD}Secret ID 更新完成! 请立即通知应用端替换凭据。${NC}"
     echo ""
     exit 0
+
+    fi  # _ROLE_EXISTS
 fi
 
 # ========================== 确认执行 ==========================================
